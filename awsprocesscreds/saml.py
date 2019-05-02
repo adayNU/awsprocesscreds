@@ -79,6 +79,12 @@ class GenericFormsBasedAuthenticator(SAMLAuthenticator):
     _ERROR_MISSING_CONFIG = (
         'Missing required config value for SAML: "%s"'
     )
+    _ERROR_NO_MFA_CONFIG = (
+        'Multifactor authentication not configured for account, but required.'
+    )
+    _ERROR_UNSUPPORTED_MFA_CONFIG = (
+        "Can't support multifactor authentication types, but required."
+    )
 
     def __init__(self, password_prompter, requests_session=None):
         """Retrieve SAML assertion using form based auth.
@@ -217,6 +223,9 @@ class GenericFormsBasedAuthenticator(SAMLAuthenticator):
 
 class OktaAuthenticator(GenericFormsBasedAuthenticator):
     _AUTH_URL = '/api/v1/authn'
+    # Used for token challenges like Google Authenticator or SMS challenges.
+    _MFA_STATES = ['MFA_REQUIRED', 'MFA_CHALLENGE']
+    _FACTOR_TYPES = ['sms', 'token:software:totp']
 
     def retrieve_saml_assertion(self, config):
         self._validate_config_values(config)
@@ -237,6 +246,29 @@ class OktaAuthenticator(GenericFormsBasedAuthenticator):
                              'password': password})
         )
         parsed = json.loads(response.text)
+        if parsed['status'] in self._MFA_STATES:
+            state_token = parsed['stateToken']
+            factors = parsed['_embedded']['factors']
+            if len(factors) == 0:
+                raise SAMLError(self._ERROR_NO_MFA_CONFIG)
+            factor = None
+            for f in factors:
+                if f['factorType'] in self._FACTOR_TYPES:
+                    factor = f
+                    break
+            if factor is None:
+                raise SAMLError(self._ERROR_UNSUPPORTED_MFA_CONFIG)
+            mfa = self._password_prompter("MFA Code from %s: " % factor['provider'])
+            response = self._requests_session.post(
+                factor['_links']['verify']['href'],
+                headers={'Content-Type': 'application/json',
+                     'Accept': 'application/json'},
+                data=json.dumps({
+                    'factorId': factor['id'],
+                    'stateToken': state_token,
+                    'passCode': mfa})
+            )
+            parsed = json.loads(response.text)
         session_token = parsed['sessionToken']
         saml_url = endpoint + '?sessionToken=%s' % session_token
         response = self._requests_session.get(saml_url)
